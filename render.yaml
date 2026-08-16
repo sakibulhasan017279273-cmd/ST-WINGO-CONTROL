@@ -1,1 +1,7 @@
-
+services:
+  - type: worker
+    name: st-wingo-master
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: true
