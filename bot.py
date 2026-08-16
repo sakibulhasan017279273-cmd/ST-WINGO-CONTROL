@@ -1,8 +1,11 @@
 import os
 import asyncio
 import logging
-import requests
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import requests
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -15,24 +18,38 @@ from telegram.ext import (
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
 CHANNEL_USERNAME = os.getenv(
     "CHANNEL_USERNAME",
     ""
 ).strip()
 
-API_URL = (
+# Render Environment Variable থেকে API নেওয়া হবে।
+# না দিলে এই default endpoint ব্যবহার করবে।
+API_URL = os.getenv(
+    "API_URL",
     "https://draw.ar-lottery01.com/"
     "WinGo/WinGo_1M/GetHistoryIssuePage.json"
+).strip()
+
+PORT = int(
+    os.getenv("PORT", "10000")
 )
 
-CHECK_INTERVAL = 4
+CHECK_INTERVAL = 3
+
+REQUEST_TIMEOUT = 12
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ST-WINGO-MASTER")
 
 # ============================================================
 # MEMORY
@@ -42,44 +59,236 @@ last_issue = None
 active_signal = None
 last_result_issue = None
 
+stats = {
+    "WIN": 0,
+    "LOSS": 0,
+    "JACKPOT": 0,
+}
 
 # ============================================================
-# WIN GO API
+# HTTP HEALTH SERVER
+# ============================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+
+        if self.path in ("/", "/health"):
+
+            body = (
+                "ST Wingo Master is running."
+            ).encode("utf-8")
+
+            self.send_response(200)
+
+            self.send_header(
+                "Content-Type",
+                "text/plain; charset=utf-8"
+            )
+
+            self.send_header(
+                "Content-Length",
+                str(len(body))
+            )
+
+            self.end_headers()
+
+            self.wfile.write(body)
+
+        else:
+
+            body = b"Not Found"
+
+            self.send_response(404)
+
+            self.send_header(
+                "Content-Type",
+                "text/plain"
+            )
+
+            self.send_header(
+                "Content-Length",
+                str(len(body))
+            )
+
+            self.end_headers()
+
+            self.wfile.write(body)
+
+    def log_message(
+        self,
+        format,
+        *args
+    ):
+        return
+
+
+def start_health_server():
+
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler
+    )
+
+    logger.info(
+        "Health server listening on port %s",
+        PORT
+    )
+
+    server.serve_forever()
+
+
+# ============================================================
+# API SESSION
+# ============================================================
+
+session = requests.Session()
+
+session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 10) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/151.0.0.0 Mobile Safari/537.36"
+    ),
+
+    "Accept": (
+        "application/json,"
+        "text/plain,"
+        "*/*"
+    ),
+
+    "Accept-Language": (
+        "en-US,en;q=0.9"
+    ),
+
+    "Cache-Control": "no-cache",
+
+    "Pragma": "no-cache",
+
+    "Connection": "keep-alive",
+
+    "Referer": (
+        "https://draw.ar-lottery01.com/"
+    ),
+})
+
+# ============================================================
+# GET API DATA
 # ============================================================
 
 def get_history():
 
     try:
 
-        response = requests.get(
-            API_URL,
-            params={"t": int(asyncio.get_event_loop().time() * 1000)},
-            timeout=10,
-            headers={
-                "User-Agent": "ST-Wingo-Master/1.0",
-                "Accept": "application/json",
-            },
+        timestamp = int(
+            time.time() * 1000
         )
+
+        response = session.get(
+            API_URL,
+            params={
+                "t": timestamp
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        logger.info(
+            "API status: %s",
+            response.status_code
+        )
+
+        if response.status_code == 403:
+
+            logger.error(
+                "WinGo API returned 403 Forbidden."
+            )
+
+            return []
 
         response.raise_for_status()
 
         data = response.json()
 
-        history = (
-            data
-            .get("data", {})
-            .get("list", [])
-        )
+        # ----------------------------------------------------
+        # Possible response structures
+        # ----------------------------------------------------
 
-        if not isinstance(history, list):
+        history = []
+
+        if isinstance(data, dict):
+
+            root_data = data.get(
+                "data"
+            )
+
+            if isinstance(
+                root_data,
+                dict
+            ):
+
+                history = root_data.get(
+                    "list",
+                    []
+                )
+
+            elif isinstance(
+                root_data,
+                list
+            ):
+
+                history = root_data
+
+            if not history:
+
+                history = data.get(
+                    "list",
+                    []
+                )
+
+        if not isinstance(
+            history,
+            list
+        ):
+
+            logger.warning(
+                "Unexpected API structure."
+            )
+
             return []
 
         return history
 
-    except Exception as error:
+    except requests.exceptions.Timeout:
 
         logger.error(
-            "API error: %s",
+            "WinGo API timeout."
+        )
+
+        return []
+
+    except requests.exceptions.RequestException as error:
+
+        logger.error(
+            "API request error: %s",
+            error
+        )
+
+        return []
+
+    except ValueError as error:
+
+        logger.error(
+            "Invalid JSON response: %s",
+            error
+        )
+
+        return []
+
+    except Exception as error:
+
+        logger.exception(
+            "Unexpected API error: %s",
             error
         )
 
@@ -87,45 +296,131 @@ def get_history():
 
 
 # ============================================================
-# HELPERS
+# EXTRACT ISSUE
 # ============================================================
 
-def number_of(item):
+def get_issue(item):
 
-    try:
-        return int(item.get("number"))
-    except Exception:
+    if not isinstance(
+        item,
+        dict
+    ):
         return None
 
+    possible_keys = [
+        "issueNumber",
+        "issue",
+        "period",
+        "issueNo",
+        "number",
+    ]
+
+    for key in possible_keys:
+
+        value = item.get(key)
+
+        if value is not None:
+
+            value = str(
+                value
+            ).strip()
+
+            if value:
+                return value
+
+    return None
+
+
+# ============================================================
+# EXTRACT NUMBER
+# ============================================================
+
+def get_number(item):
+
+    if not isinstance(
+        item,
+        dict
+    ):
+        return None
+
+    possible_keys = [
+        "number",
+        "code",
+        "result",
+        "resultNumber",
+    ]
+
+    for key in possible_keys:
+
+        value = item.get(key)
+
+        if value is None:
+            continue
+
+        try:
+
+            text = str(
+                value
+            )
+
+            digits = [
+                char
+                for char in text
+                if char.isdigit()
+            ]
+
+            if not digits:
+                continue
+
+            number = int(
+                digits[-1]
+            )
+
+            if 0 <= number <= 9:
+                return number
+
+        except Exception:
+            continue
+
+    return None
+
+
+# ============================================================
+# BIG / SMALL
+# ============================================================
 
 def big_small(number):
 
     if number is None:
         return None
 
-    return "BIG" if number >= 5 else "SMALL"
+    if number >= 5:
+        return "BIG"
 
+    return "SMALL"
+
+
+# ============================================================
+# NEXT PERIOD
+# ============================================================
 
 def next_period(issue):
 
     try:
+
         return str(
             int(str(issue)) + 1
         )
+
     except Exception:
-        return str(issue)
+
+        return str(
+            issue
+        )
 
 
 # ============================================================
 # SIGNAL ENGINE
-#
-# This follows the supplied source structure:
-# - recent history
-# - BIG / SMALL classification
-# - multiple observations
-# - two number candidates
-#
-# Signals are predictions, not guaranteed outcomes.
 # ============================================================
 
 def generate_signal(history):
@@ -134,10 +429,14 @@ def generate_signal(history):
 
     for item in history[:20]:
 
-        number = number_of(item)
+        number = get_number(
+            item
+        )
 
         if number is not None:
-            numbers.append(number)
+            numbers.append(
+                number
+            )
 
     if len(numbers) < 3:
 
@@ -147,18 +446,16 @@ def generate_signal(history):
             "confidence": 0,
         }
 
-
     sizes = [
-        big_small(n)
-        for n in numbers
+        big_small(number)
+        for number in numbers
     ]
 
     big_score = 0
     small_score = 0
 
-
     # --------------------------------------------------------
-    # Recent weighted observation
+    # Weighted recent trend
     # --------------------------------------------------------
 
     for index, side in enumerate(
@@ -168,10 +465,12 @@ def generate_signal(history):
         weight = 10 - index
 
         if side == "BIG":
-            big_score += weight
-        else:
-            small_score += weight
 
+            big_score += weight
+
+        elif side == "SMALL":
+
+            small_score += weight
 
     # --------------------------------------------------------
     # Streak reversal
@@ -180,19 +479,21 @@ def generate_signal(history):
     if len(sizes) >= 3:
 
         if (
-            sizes[0] ==
-            sizes[1] ==
-            sizes[2]
+            sizes[0]
+            == sizes[1]
+            == sizes[2]
         ):
 
             if sizes[0] == "BIG":
+
                 small_score += 8
+
             else:
+
                 big_score += 8
 
-
     # --------------------------------------------------------
-    # Alternation
+    # Zig-zag detection
     # --------------------------------------------------------
 
     if len(sizes) >= 4:
@@ -206,45 +507,68 @@ def generate_signal(history):
         if alternating:
 
             if sizes[0] == "BIG":
-                small_score += 5
-            else:
-                big_score += 5
 
+                small_score += 5
+
+            else:
+
+                big_score += 5
 
     # --------------------------------------------------------
     # Frequency balance
     # --------------------------------------------------------
 
-    big_count = sizes.count("BIG")
-    small_count = sizes.count("SMALL")
+    big_count = sizes.count(
+        "BIG"
+    )
+
+    small_count = sizes.count(
+        "SMALL"
+    )
 
     if big_count < small_count:
+
         big_score += 3
 
     elif small_count < big_count:
+
         small_score += 3
 
-
     # --------------------------------------------------------
-    # Final BIG / SMALL
+    # Final prediction
     # --------------------------------------------------------
 
-    prediction = (
-        "BIG"
-        if big_score >= small_score
-        else "SMALL"
-    )
+    if big_score >= small_score:
 
+        prediction = "BIG"
+
+    else:
+
+        prediction = "SMALL"
 
     # --------------------------------------------------------
     # Number candidates
     # --------------------------------------------------------
 
-    pool = (
-        [5, 6, 7, 8, 9]
-        if prediction == "BIG"
-        else [0, 1, 2, 3, 4]
-    )
+    if prediction == "BIG":
+
+        pool = [
+            5,
+            6,
+            7,
+            8,
+            9,
+        ]
+
+    else:
+
+        pool = [
+            0,
+            1,
+            2,
+            3,
+            4,
+        ]
 
     frequency = {
         number: 0
@@ -254,8 +578,8 @@ def generate_signal(history):
     for number in numbers:
 
         if number in frequency:
-            frequency[number] += 1
 
+            frequency[number] += 1
 
     ranked = sorted(
         pool,
@@ -265,38 +589,43 @@ def generate_signal(history):
     )
 
     number_one = ranked[0]
-    number_two = ranked[1]
 
+    number_two = ranked[1]
 
     # --------------------------------------------------------
     # Confidence
     # --------------------------------------------------------
 
     total = (
-        big_score +
-        small_score
+        big_score
+        + small_score
     )
 
-    if total:
+    if total > 0:
 
         confidence = round(
-            60 +
-            (
+            60
+            + (
                 max(
                     big_score,
                     small_score
-                ) / total
-            ) * 30
+                )
+                / total
+            )
+            * 30
         )
 
     else:
+
         confidence = 60
 
     confidence = max(
         50,
-        min(98, confidence)
+        min(
+            98,
+            confidence
+        )
     )
-
 
     return {
         "prediction": prediction,
@@ -309,7 +638,7 @@ def generate_signal(history):
 
 
 # ============================================================
-# RESULT
+# RESULT CHECK
 # ============================================================
 
 def calculate_result(
@@ -318,6 +647,7 @@ def calculate_result(
 ):
 
     if actual_number in signal["numbers"]:
+
         return "JACKPOT"
 
     actual_size = big_small(
@@ -325,16 +655,17 @@ def calculate_result(
     )
 
     if (
-        signal["prediction"]
-        == actual_size
+        actual_size
+        == signal["prediction"]
     ):
+
         return "WIN"
 
     return "LOSS"
 
 
 # ============================================================
-# TELEGRAM MESSAGE
+# SIGNAL MESSAGE
 # ============================================================
 
 def signal_message(
@@ -343,12 +674,12 @@ def signal_message(
 ):
 
     numbers = " / ".join(
-        str(x)
-        for x in signal["numbers"]
+        str(number)
+        for number in signal["numbers"]
     )
 
     return (
-        "🔥⚡ ST WINGO MASTER ⚡🔥\n"
+        "🔥⚡ <b>ST WINGO MASTER</b> ⚡🔥\n"
         "\n"
         "🎯 <b>PERIOD</b>\n"
         f"<code>{period}</code>\n"
@@ -356,20 +687,23 @@ def signal_message(
         "💥 <b>SIGNAL</b>\n"
         f"<b>{signal['prediction']}</b>\n"
         "\n"
-        "🎰 <b>NUMBERS</b>\n"
+        "🎰 <b>NUMBER</b>\n"
         f"<b>{numbers}</b>\n"
         "\n"
         "💯 <b>CONFIDENCE</b>\n"
         f"<b>{signal['confidence']}%</b>\n"
         "\n"
         "⏱ <b>MARKET</b>\n"
-        "<b>WINGO 1 MIN</b>\n"
+        "<b>WINGO 1 MINUTE</b>\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ Prediction only — "
-        "no result is guaranteed."
+        "⚠️ Prediction only."
     )
 
+
+# ============================================================
+# RESULT MESSAGE
+# ============================================================
 
 def result_message(
     period,
@@ -378,16 +712,21 @@ def result_message(
 ):
 
     emoji = {
-        "WIN": "👑",
+        "WIN": "✅",
         "LOSS": "❌",
         "JACKPOT": "🎰",
-    }.get(result, "📊")
+    }.get(
+        result,
+        "📊"
+    )
 
     return (
         f"{emoji} <b>{result}</b>\n"
         "\n"
-        f"🎯 Period: <code>{period}</code>\n"
-        f"🔢 Result Number: <b>{actual}</b>\n"
+        f"🎯 Period: "
+        f"<code>{period}</code>\n"
+        f"🔢 Result Number: "
+        f"<b>{actual}</b>\n"
         "\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "🔥 ST WINGO MASTER"
@@ -404,9 +743,11 @@ async def send_channel(
 ):
 
     if not CHANNEL_USERNAME:
+
         logger.warning(
             "CHANNEL_USERNAME is not configured."
         )
+
         return
 
     try:
@@ -426,7 +767,7 @@ async def send_channel(
 
 
 # ============================================================
-# ENGINE
+# MAIN ENGINE
 # ============================================================
 
 async def engine(
@@ -436,6 +777,10 @@ async def engine(
     global last_issue
     global active_signal
     global last_result_issue
+
+    logger.info(
+        "Signal engine started."
+    )
 
     while True:
 
@@ -451,21 +796,25 @@ async def engine(
 
                 continue
 
-
             latest = history[0]
 
-            issue = str(
-                latest.get(
-                    "issueNumber",
-                    ""
-                )
-            )
-
-            actual = number_of(
+            issue = get_issue(
                 latest
             )
 
-            if not issue or actual is None:
+            actual = get_number(
+                latest
+            )
+
+            if (
+                issue is None
+                or actual is None
+            ):
+
+                logger.warning(
+                    "Latest API item missing issue/number: %s",
+                    latest
+                )
 
                 await asyncio.sleep(
                     CHECK_INTERVAL
@@ -473,9 +822,8 @@ async def engine(
 
                 continue
 
-
             # ------------------------------------------------
-            # Previous signal result
+            # New result detected
             # ------------------------------------------------
 
             if (
@@ -490,6 +838,8 @@ async def engine(
                     actual
                 )
 
+                stats[result] += 1
+
                 await send_channel(
                     application,
                     result_message(
@@ -501,36 +851,49 @@ async def engine(
 
                 last_result_issue = issue
 
-
-            # ------------------------------------------------
-            # Generate next signal
-            # ------------------------------------------------
-
-            signal = generate_signal(
-                history
-            )
-
-            period = next_period(
-                issue
-            )
-
-            if (
-                signal["prediction"]
-                != "WAIT"
-            ):
-
-                active_signal = signal
-
-                await send_channel(
-                    application,
-                    signal_message(
-                        period,
-                        signal
-                    )
+                logger.info(
+                    "Result: %s | Issue: %s | Number: %s",
+                    result,
+                    issue,
+                    actual
                 )
 
-            last_issue = issue
+            # ------------------------------------------------
+            # Generate next signal only once per new issue
+            # ------------------------------------------------
 
+            if issue != last_issue:
+
+                signal = generate_signal(
+                    history
+                )
+
+                if (
+                    signal["prediction"]
+                    != "WAIT"
+                ):
+
+                    period = next_period(
+                        issue
+                    )
+
+                    active_signal = signal
+
+                    await send_channel(
+                        application,
+                        signal_message(
+                            period,
+                            signal
+                        )
+                    )
+
+                    logger.info(
+                        "New signal: %s | Period: %s",
+                        signal["prediction"],
+                        period
+                    )
+
+                last_issue = issue
 
         except Exception as error:
 
@@ -545,7 +908,7 @@ async def engine(
 
 
 # ============================================================
-# TELEGRAM COMMANDS
+# /START
 # ============================================================
 
 async def start(
@@ -556,10 +919,14 @@ async def start(
     await update.message.reply_text(
         "🔥 ST WINGO MASTER\n\n"
         "Bot is online.\n"
-        "Market: Wingo 1 Minute\n"
+        "Market: Wingo 1 Minute\n\n"
         "Use /signal to check the current signal."
     )
 
+
+# ============================================================
+# /SIGNAL
+# ============================================================
 
 async def signal_command(
     update: Update,
@@ -576,15 +943,19 @@ async def signal_command(
 
         return
 
-
     latest = history[0]
 
-    issue = str(
-        latest.get(
-            "issueNumber",
-            ""
-        )
+    issue = get_issue(
+        latest
     )
+
+    if issue is None:
+
+        await update.message.reply_text(
+            "⚠️ Current period unavailable."
+        )
+
+        return
 
     signal = generate_signal(
         history
@@ -598,7 +969,6 @@ async def signal_command(
 
         return
 
-
     await update.message.reply_text(
         signal_message(
             next_period(issue),
@@ -608,6 +978,10 @@ async def signal_command(
     )
 
 
+# ============================================================
+# /STATUS
+# ============================================================
+
 async def status(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -615,32 +989,32 @@ async def status(
 
     history = get_history()
 
-    if history:
-
-        issue = str(
-            history[0].get(
-                "issueNumber",
-                ""
-            )
-        )
+    if not history:
 
         await update.message.reply_text(
-            "🟢 <b>BOT ONLINE</b>\n\n"
-            f"🎯 Current Period: "
-            f"<code>{issue}</code>\n"
-            "⏱ Market: <b>Wingo 1M</b>",
-            parse_mode="HTML"
+            "🔴 API unavailable."
         )
 
-    else:
+        return
 
-        await update.message.reply_text(
-            "🔴 API connection unavailable."
-        )
+    issue = get_issue(
+        history[0]
+    )
+
+    await update.message.reply_text(
+        "🟢 <b>ST WINGO MASTER ONLINE</b>\n\n"
+        f"🎯 Current Period: "
+        f"<code>{issue}</code>\n"
+        "⏱ Market: <b>Wingo 1 Minute</b>\n\n"
+        f"✅ WIN: <b>{stats['WIN']}</b>\n"
+        f"❌ LOSS: <b>{stats['LOSS']}</b>\n"
+        f"🎰 JACKPOT: <b>{stats['JACKPOT']}</b>",
+        parse_mode="HTML"
+    )
 
 
 # ============================================================
-# MAIN
+# POST INIT
 # ============================================================
 
 async def post_init(
@@ -656,6 +1030,10 @@ async def post_init(
     )
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
 
     if not BOT_TOKEN:
@@ -663,6 +1041,21 @@ def main():
         raise RuntimeError(
             "BOT_TOKEN environment variable is missing."
         )
+
+    # --------------------------------------------------------
+    # Start Render HTTP server
+    # --------------------------------------------------------
+
+    health_thread = threading.Thread(
+        target=start_health_server,
+        daemon=True
+    )
+
+    health_thread.start()
+
+    # --------------------------------------------------------
+    # Telegram application
+    # --------------------------------------------------------
 
     application = (
         Application.builder()
@@ -694,6 +1087,11 @@ def main():
 
     logger.info(
         "ST Wingo Master starting..."
+    )
+
+    logger.info(
+        "API URL: %s",
+        API_URL
     )
 
     application.run_polling(
